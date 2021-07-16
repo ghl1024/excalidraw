@@ -2,7 +2,7 @@ import React, { useContext } from "react";
 import { RoughCanvas } from "roughjs/bin/canvas";
 import rough from "roughjs/bin/rough";
 import clsx from "clsx";
-import { supported } from "browser-fs-access";
+import { supported as fsSupported } from "browser-fs-access";
 import { nanoid } from "nanoid";
 
 import {
@@ -111,7 +111,6 @@ import {
 import { LinearElementEditor } from "../element/linearElementEditor";
 import { mutateElement } from "../element/mutateElement";
 import { deepCopyElement, newFreeDrawElement } from "../element/newElement";
-import { MaybeTransformHandleType } from "../element/transformHandles";
 import {
   isBindingElement,
   isBindingElementType,
@@ -157,6 +156,7 @@ import {
   getElementsWithinSelection,
   getNormalizedZoom,
   getSelectedElements,
+  hasBackground,
   isOverScrollBars,
   isSomeElementSelected,
 } from "../scene";
@@ -167,9 +167,11 @@ import { findShapeByKey } from "../shapes";
 import {
   AppProps,
   AppState,
+  ExcalidrawImperativeAPI,
   Gesture,
   GestureEvent,
   LibraryItems,
+  PointerDownState,
   SceneData,
 } from "../types";
 import {
@@ -180,7 +182,6 @@ import {
   isToolIcon,
   isWritableElement,
   resetCursor,
-  ResolvablePromise,
   resolvablePromise,
   sceneCoordsToViewportCoords,
   setCursor,
@@ -197,9 +198,10 @@ import { actionToggleViewMode } from "../actions/actionToggleViewMode";
 
 const IsMobileContext = React.createContext(false);
 export const useIsMobile = () => useContext(IsMobileContext);
-const ExcalidrawContainerContext = React.createContext<HTMLDivElement | null>(
-  null,
-);
+const ExcalidrawContainerContext = React.createContext<{
+  container: HTMLDivElement | null;
+  id: string | null;
+}>({ container: null, id: null });
 export const useExcalidrawContainer = () =>
   useContext(ExcalidrawContainerContext);
 
@@ -220,83 +222,6 @@ const gesture: Gesture = {
   lastCenter: null,
   initialDistance: null,
   initialScale: null,
-};
-
-export type PointerDownState = Readonly<{
-  // The first position at which pointerDown happened
-  origin: Readonly<{ x: number; y: number }>;
-  // Same as "origin" but snapped to the grid, if grid is on
-  originInGrid: Readonly<{ x: number; y: number }>;
-  // Scrollbar checks
-  scrollbars: ReturnType<typeof isOverScrollBars>;
-  // The previous pointer position
-  lastCoords: { x: number; y: number };
-  // map of original elements data
-  originalElements: Map<string, NonDeleted<ExcalidrawElement>>;
-  resize: {
-    // Handle when resizing, might change during the pointer interaction
-    handleType: MaybeTransformHandleType;
-    // This is determined on the initial pointer down event
-    isResizing: boolean;
-    // This is determined on the initial pointer down event
-    offset: { x: number; y: number };
-    // This is determined on the initial pointer down event
-    arrowDirection: "origin" | "end";
-    // This is a center point of selected elements determined on the initial pointer down event (for rotation only)
-    center: { x: number; y: number };
-  };
-  hit: {
-    // The element the pointer is "hitting", is determined on the initial
-    // pointer down event
-    element: NonDeleted<ExcalidrawElement> | null;
-    // The elements the pointer is "hitting", is determined on the initial
-    // pointer down event
-    allHitElements: NonDeleted<ExcalidrawElement>[];
-    // This is determined on the initial pointer down event
-    wasAddedToSelection: boolean;
-    // Whether selected element(s) were duplicated, might change during the
-    // pointer interaction
-    hasBeenDuplicated: boolean;
-    hasHitCommonBoundingBoxOfSelectedElements: boolean;
-  };
-  withCmdOrCtrl: boolean;
-  drag: {
-    // Might change during the pointer interation
-    hasOccurred: boolean;
-    // Might change during the pointer interation
-    offset: { x: number; y: number } | null;
-  };
-  // We need to have these in the state so that we can unsubscribe them
-  eventListeners: {
-    // It's defined on the initial pointer down event
-    onMove: null | ((event: PointerEvent) => void);
-    // It's defined on the initial pointer down event
-    onUp: null | ((event: PointerEvent) => void);
-    // It's defined on the initial pointer down event
-    onKeyDown: null | ((event: KeyboardEvent) => void);
-    // It's defined on the initial pointer down event
-    onKeyUp: null | ((event: KeyboardEvent) => void);
-  };
-}>;
-
-export type ExcalidrawImperativeAPI = {
-  updateScene: InstanceType<typeof App>["updateScene"];
-  resetScene: InstanceType<typeof App>["resetScene"];
-  getSceneElementsIncludingDeleted: InstanceType<
-    typeof App
-  >["getSceneElementsIncludingDeleted"];
-  history: {
-    clear: InstanceType<typeof App>["resetHistory"];
-  };
-  scrollToContent: InstanceType<typeof App>["scrollToContent"];
-  getSceneElements: InstanceType<typeof App>["getSceneElements"];
-  getAppState: () => InstanceType<typeof App>["state"];
-  refresh: InstanceType<typeof App>["refresh"];
-  importLibrary: InstanceType<typeof App>["importLibraryFromUrl"];
-  setToastMessage: InstanceType<typeof App>["setToastMessage"];
-  readyPromise: ResolvablePromise<ExcalidrawImperativeAPI>;
-  ready: true;
-  id: string;
 };
 
 class App extends React.Component<AppProps, AppState> {
@@ -321,6 +246,10 @@ class App extends React.Component<AppProps, AppState> {
   public libraryItemsFromStorage: LibraryItems | undefined;
   private id: string;
   private history: History;
+  private excalidrawContainerValue: {
+    container: HTMLDivElement | null;
+    id: string;
+  };
 
   constructor(props: AppProps) {
     super(props);
@@ -377,6 +306,12 @@ class App extends React.Component<AppProps, AppState> {
       }
       readyPromise.resolve(api);
     }
+
+    this.excalidrawContainerValue = {
+      container: this.excalidrawContainerRef.current,
+      id: this.id,
+    };
+
     this.scene = new Scene();
     this.library = new Library(this);
     this.history = new History();
@@ -404,11 +339,11 @@ class App extends React.Component<AppProps, AppState> {
     if (viewModeEnabled) {
       return (
         <canvas
-          id="canvas"
+          className="excalidraw__canvas"
           style={{
             width: canvasDOMWidth,
             height: canvasDOMHeight,
-            cursor: "grabbing",
+            cursor: CURSOR_TYPE.GRAB,
           }}
           width={canvasWidth}
           height={canvasHeight}
@@ -426,7 +361,7 @@ class App extends React.Component<AppProps, AppState> {
     }
     return (
       <canvas
-        id="canvas"
+        className="excalidraw__canvas"
         style={{
           width: canvasDOMWidth,
           height: canvasDOMHeight,
@@ -452,7 +387,6 @@ class App extends React.Component<AppProps, AppState> {
 
     const {
       onCollabButtonClick,
-      onExportToBackend,
       renderTopRightUI,
       renderFooter,
       renderCustomStats,
@@ -472,7 +406,7 @@ class App extends React.Component<AppProps, AppState> {
         }
       >
         <ExcalidrawContainerContext.Provider
-          value={this.excalidrawContainerRef.current}
+          value={this.excalidrawContainerValue}
         >
           <IsMobileContext.Provider value={this.isMobile}>
             <LayerUI
@@ -493,7 +427,6 @@ class App extends React.Component<AppProps, AppState> {
               toggleZenMode={this.toggleZenMode}
               langCode={getLanguage().code}
               isCollaborating={this.props.isCollaborating || false}
-              onExportToBackend={onExportToBackend}
               renderTopRightUI={renderTopRightUI}
               renderCustomFooter={renderFooter}
               viewModeEnabled={viewModeEnabled}
@@ -536,7 +469,9 @@ class App extends React.Component<AppProps, AppState> {
   }
 
   public focusContainer = () => {
-    this.excalidrawContainerRef.current?.focus();
+    if (this.props.autoFocus) {
+      this.excalidrawContainerRef.current?.focus();
+    }
   };
 
   public getSceneElementsIncludingDeleted = () => {
@@ -720,7 +655,11 @@ class App extends React.Component<AppProps, AppState> {
           const fileHandle = launchParams.files[0];
           const blob: Blob = await fileHandle.getFile();
           blob.handle = fileHandle;
-          loadFromBlob(blob, this.state)
+          loadFromBlob(
+            blob,
+            this.state,
+            this.scene.getElementsIncludingDeleted(),
+          )
             .then(({ elements, appState }) =>
               this.syncActionResult({
                 elements,
@@ -758,7 +697,7 @@ class App extends React.Component<AppProps, AppState> {
       };
     }
 
-    const scene = restore(initialData, null);
+    const scene = restore(initialData, null, null);
     scene.appState = {
       ...scene.appState,
       isLoading: false,
@@ -802,6 +741,8 @@ class App extends React.Component<AppProps, AppState> {
   };
 
   public async componentDidMount() {
+    this.excalidrawContainerValue.container = this.excalidrawContainerRef.current;
+
     if (
       process.env.NODE_ENV === ENV.TEST ||
       process.env.NODE_ENV === ENV.DEVELOPMENT
@@ -986,14 +927,12 @@ class App extends React.Component<AppProps, AppState> {
     }
 
     if (prevProps.viewModeEnabled !== this.props.viewModeEnabled) {
-      this.setState(
-        { viewModeEnabled: !!this.props.viewModeEnabled },
-        this.addEventListeners,
-      );
+      this.setState({ viewModeEnabled: !!this.props.viewModeEnabled });
     }
 
     if (prevState.viewModeEnabled !== this.state.viewModeEnabled) {
       this.addEventListeners();
+      this.deselectElements();
     }
 
     if (prevProps.zenModeEnabled !== this.props.zenModeEnabled) {
@@ -1267,7 +1206,7 @@ class App extends React.Component<AppProps, AppState> {
         });
       } else if (data.elements) {
         this.addElementsFromPasteOrLibrary({
-          elements: restoreElements(data.elements),
+          elements: data.elements,
           position: "cursor",
         });
       } else if (data.text) {
@@ -1282,7 +1221,7 @@ class App extends React.Component<AppProps, AppState> {
     elements: readonly ExcalidrawElement[];
     position: { clientX: number; clientY: number } | "cursor" | "center";
   }) => {
-    const elements = restoreElements(opts.elements);
+    const elements = restoreElements(opts.elements, null);
     const [minX, minY, maxX, maxY] = getCommonBounds(elements);
 
     const elementsCenterX = distance(minX, maxX) / 2;
@@ -1348,6 +1287,7 @@ class App extends React.Component<AppProps, AppState> {
         this.scene.getElements(),
       ),
     );
+    this.selectShapeTool("selection");
   };
 
   private addTextFromPaste(text: any) {
@@ -1645,12 +1585,38 @@ class App extends React.Component<AppProps, AppState> {
         isHoldingSpace = true;
         setCursor(this.canvas, CURSOR_TYPE.GRABBING);
       }
+
+      if (event.key === KEYS.G || event.key === KEYS.S) {
+        const selectedElements = getSelectedElements(
+          this.scene.getElements(),
+          this.state,
+        );
+        if (
+          this.state.elementType === "selection" &&
+          !selectedElements.length
+        ) {
+          return;
+        }
+
+        if (
+          event.key === KEYS.G &&
+          (hasBackground(this.state.elementType) ||
+            selectedElements.some((element) => hasBackground(element.type)))
+        ) {
+          this.setState({ openPopup: "backgroundColorPicker" });
+        }
+        if (event.key === KEYS.S) {
+          this.setState({ openPopup: "strokeColorPicker" });
+        }
+      }
     },
   );
 
   private onKeyUp = withBatchedUpdates((event: KeyboardEvent) => {
     if (event.key === KEYS.SPACE) {
-      if (this.state.elementType === "selection") {
+      if (this.state.viewModeEnabled) {
+        setCursor(this.canvas, CURSOR_TYPE.GRAB);
+      } else if (this.state.elementType === "selection") {
         resetCursor(this.canvas);
       } else {
         setCursorForShape(this.canvas, this.state.elementType);
@@ -1798,7 +1764,8 @@ class App extends React.Component<AppProps, AppState> {
               [element.id]: true,
             },
           }));
-        } else {
+        }
+        if (isDeleted) {
           fixBindingsAfterDeletion(this.scene.getElements(), [element]);
         }
         if (!isDeleted || isExistingElement) {
@@ -1819,15 +1786,19 @@ class App extends React.Component<AppProps, AppState> {
       excalidrawContainer: this.excalidrawContainerRef.current,
     });
     // deselect all other elements when inserting text
+    this.deselectElements();
+
+    // do an initial update to re-initialize element position since we were
+    // modifying element's x/y for sake of editor (case: syncing to remote)
+    updateElement(element.text);
+  }
+
+  private deselectElements() {
     this.setState({
       selectedElementIds: {},
       selectedGroupIds: {},
       editingGroupId: null,
     });
-
-    // do an initial update to re-initialize element position since we were
-    // modifying element's x/y for sake of editor (case: syncing to remote)
-    updateElement(element.text);
   }
 
   private getTextElementAtPosition(
@@ -1845,9 +1816,21 @@ class App extends React.Component<AppProps, AppState> {
   private getElementAtPosition(
     x: number,
     y: number,
+    opts?: {
+      /** if true, returns the first selected element (with highest z-index)
+        of all hit elements */
+      preferSelected?: boolean;
+    },
   ): NonDeleted<ExcalidrawElement> | null {
     const allHitElements = this.getElementsAtPosition(x, y);
     if (allHitElements.length > 1) {
+      if (opts?.preferSelected) {
+        for (let index = allHitElements.length - 1; index > -1; index--) {
+          if (this.state.selectedElementIds[allHitElements[index].id]) {
+            return allHitElements[index];
+          }
+        }
+      }
       const elementWithHighestZIndex =
         allHitElements[allHitElements.length - 1];
       // If we're hitting element with highest z-index only on its bounding box
@@ -2258,6 +2241,8 @@ class App extends React.Component<AppProps, AppState> {
         this.canvas,
         isTextElement(hitElement) ? CURSOR_TYPE.TEXT : CURSOR_TYPE.CROSSHAIR,
       );
+    } else if (this.state.viewModeEnabled) {
+      setCursor(this.canvas, CURSOR_TYPE.GRAB);
     } else if (isOverScrollBar) {
       setCursor(this.canvas, CURSOR_TYPE.AUTO);
     } else if (
@@ -2283,8 +2268,6 @@ class App extends React.Component<AppProps, AppState> {
   private handleCanvasPointerDown = (
     event: React.PointerEvent<HTMLCanvasElement>,
   ) => {
-    event.persist();
-
     // remove any active selection when we start to interact with canvas
     // (mainly, we care about removing selection outside the component which
     //  would prevent our copy handling otherwise)
@@ -2497,7 +2480,11 @@ class App extends React.Component<AppProps, AppState> {
         lastPointerUp = null;
         isPanning = false;
         if (!isHoldingSpace) {
-          setCursorForShape(this.canvas, this.state.elementType);
+          if (this.state.viewModeEnabled) {
+            setCursor(this.canvas, CURSOR_TYPE.GRAB);
+          } else {
+            setCursorForShape(this.canvas, this.state.elementType);
+          }
         }
         this.setState({
           cursorButton: "up",
@@ -3840,7 +3827,22 @@ class App extends React.Component<AppProps, AppState> {
     try {
       const file = event.dataTransfer.files[0];
       if (file?.type === "image/png" || file?.type === "image/svg+xml") {
-        const { elements, appState } = await loadFromBlob(file, this.state);
+        if (fsSupported) {
+          try {
+            // This will only work as of Chrome 86,
+            // but can be safely ignored on older releases.
+            const item = event.dataTransfer.items[0];
+            (file as any).handle = await (item as any).getAsFileSystemHandle();
+          } catch (error) {
+            console.warn(error.name, error.message);
+          }
+        }
+
+        const { elements, appState } = await loadFromBlob(
+          file,
+          this.state,
+          this.scene.getElementsIncludingDeleted(),
+        );
         this.syncActionResult({
           elements,
           appState: {
@@ -3885,7 +3887,7 @@ class App extends React.Component<AppProps, AppState> {
       // default: assume an Excalidraw file regardless of extension/MimeType
     } else {
       this.setState({ isLoading: true });
-      if (supported) {
+      if (fsSupported) {
         try {
           // This will only work as of Chrome 86,
           // but can be safely ignored on older releases.
@@ -3900,7 +3902,7 @@ class App extends React.Component<AppProps, AppState> {
   };
 
   loadFileToCanvas = (file: Blob) => {
-    loadFromBlob(file, this.state)
+    loadFromBlob(file, this.state, this.scene.getElementsIncludingDeleted())
       .then(({ elements, appState }) =>
         this.syncActionResult({
           elements,
@@ -3922,7 +3924,7 @@ class App extends React.Component<AppProps, AppState> {
     event.preventDefault();
 
     const { x, y } = viewportCoordsToSceneCoords(event, this.state);
-    const element = this.getElementAtPosition(x, y);
+    const element = this.getElementAtPosition(x, y, { preferSelected: true });
 
     const type = element ? "element" : "canvas";
 

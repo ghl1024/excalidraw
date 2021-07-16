@@ -1,8 +1,9 @@
-import { fileSave } from "browser-fs-access";
+import { fileSave, FileSystemHandle } from "browser-fs-access";
 import {
   copyBlobToClipboardAsPng,
   copyTextToSystemClipboard,
 } from "../clipboard";
+import { DEFAULT_EXPORT_PADDING } from "../constants";
 import { NonDeletedExcalidrawElement } from "../element/types";
 import { t } from "../i18n";
 import { exportToCanvas, exportToSvg } from "../scene/export";
@@ -20,48 +21,41 @@ export const exportCanvas = async (
   appState: AppState,
   {
     exportBackground,
-    exportPadding = 10,
+    exportPadding = DEFAULT_EXPORT_PADDING,
     viewBackgroundColor,
     name,
-    scale = 1,
-    shouldAddWatermark,
+    fileHandle = null,
   }: {
     exportBackground: boolean;
     exportPadding?: number;
     viewBackgroundColor: string;
     name: string;
-    scale?: number;
-    shouldAddWatermark: boolean;
+    fileHandle?: FileSystemHandle | null;
   },
 ) => {
   if (elements.length === 0) {
     throw new Error(t("alerts.cannotExportEmptyCanvas"));
   }
   if (type === "svg" || type === "clipboard-svg") {
-    const tempSvg = exportToSvg(elements, {
+    const tempSvg = await exportToSvg(elements, {
       exportBackground,
       exportWithDarkMode: appState.exportWithDarkMode,
       viewBackgroundColor,
       exportPadding,
-      scale,
-      shouldAddWatermark,
-      metadata:
-        appState.exportEmbedScene && type === "svg"
-          ? await (
-              await import(/* webpackChunkName: "image" */ "./image")
-            ).encodeSvgMetadata({
-              text: serializeAsJSON(elements, appState),
-            })
-          : undefined,
+      exportScale: appState.exportScale,
+      exportEmbedScene: appState.exportEmbedScene && type === "svg",
     });
     if (type === "svg") {
-      await fileSave(new Blob([tempSvg.outerHTML], { type: "image/svg+xml" }), {
-        fileName: `${name}.svg`,
-        extensions: [".svg"],
-      });
-      return;
+      return await fileSave(
+        new Blob([tempSvg.outerHTML], { type: "image/svg+xml" }),
+        {
+          fileName: `${name}.svg`,
+          extensions: [".svg"],
+        },
+        fileHandle,
+      );
     } else if (type === "clipboard-svg") {
-      copyTextToSystemClipboard(tempSvg.outerHTML);
+      await copyTextToSystemClipboard(tempSvg.outerHTML);
       return;
     }
   }
@@ -70,8 +64,6 @@ export const exportCanvas = async (
     exportBackground,
     viewBackgroundColor,
     exportPadding,
-    scale,
-    shouldAddWatermark,
   });
   tempCanvas.style.display = "none";
   document.body.appendChild(tempCanvas);
@@ -89,10 +81,14 @@ export const exportCanvas = async (
       });
     }
 
-    await fileSave(blob, {
-      fileName,
-      extensions: [".png"],
-    });
+    return await fileSave(
+      blob,
+      {
+        fileName,
+        extensions: [".png"],
+      },
+      fileHandle,
+    );
   } else if (type === "clipboard") {
     try {
       await copyBlobToClipboardAsPng(blob);
